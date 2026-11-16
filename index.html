@@ -1,0 +1,304 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>접힌 몸 · FOLD</title><!-- CSS: 색상·글자·버튼 위치 등 화면의 모양을 설정합니다. -->
+<style>
+*{box-sizing:border-box}body{margin:0;background:#eae6df;color:#292721;font-family:Arial,'Malgun Gothic',sans-serif}#view{position:fixed;inset:0}header{position:fixed;top:24px;left:24px;z-index:3;pointer-events:none}small{letter-spacing:3px;font-size:11px}h1{font-size:34px;margin:10px 0}header p{font-size:13px;line-height:1.8;margin:0}#panel{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);width:min(590px,calc(100% - 28px));background:#faf8f1ed;border:1px solid #d8d1c5;border-radius:18px;padding:18px;z-index:4;box-shadow:0 10px 40px #25201714}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}button,a.button{padding:11px 14px;border:1px solid #cfc6b6;border-radius:9px;background:transparent;color:#292721;font-size:13px;text-decoration:none;cursor:pointer}button.primary{background:#302d25;color:#fff}button:disabled{opacity:.5;cursor:wait}input{width:100%;accent-color:#554432;margin:15px 0 8px}#status{font-size:12px;line-height:1.6;margin:10px 0 0}#pct{margin-left:auto;font-size:12px}#back{display:none}body.ar header{color:#fff;text-shadow:0 1px 6px #000}body.ar #back{display:inline-block}.note{font-size:11px;line-height:1.5;color:#766e61;margin-top:8px}@media(max-width:600px){header{top:18px;left:18px}h1{font-size:27px}header p{max-width:260px;font-size:12px}}
+</style><!-- importmap: three라는 이름을 실제 라이브러리 주소에 연결합니다. -->
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script></head><body>
+<!-- view: 3D 캔버스와 AR 카메라 영상이 들어가는 공간 -->
+<div id="view"></div><header><small>FOLD / INTO THE BODY</small><h1>접힌 몸</h1><p>십자가의 펼쳐진 몸이<br>여섯 면 안으로 모입니다.</p></header><!-- 버튼의 id는 아래 JavaScript에서 사용하므로 이름을 바꾸면 코드도 함께 수정해야 합니다. -->
+<div id="panel"><div class="row"><button id="play" class="primary">접기 · 재생</button><button id="reset">펼치기</button><button id="ar" disabled>카메라 AR</button><button id="back">3D로 돌아가기</button><a class="button" href="cube_net_A4.pdf" target="_blank" rel="noopener">전개도 인쇄 ↗</a><span id="pct">0%</span></div><input id="fold" type="range" min="0" max="1" value="0" step=".001" aria-label="접힘 정도"><p id="status" role="status">모델 준비 중…</p><div class="note">마우스·손가락으로 회전 / 확대 · AR에서는 전개도 전체 또는 조립된 큐브의 얼굴·상체 면을 비춰 주세요.</div></div>
+<script type="module">
+/* ============================================================
+   접힌 몸 — 학생 수정용
+   이 코드는 인체 관절이 아니라 이미지가 입혀진 여섯 면을 접습니다.
+   index.html은 기존 assets 폴더, cube_net_A4.pdf 옆에 놓아 주세요.
+   ============================================================ */
+import * as T from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ── 1. 가장 먼저 수정할 설정 ──────────────────────────────────
+const CONFIG = {
+  // 1: 기존 방향(+Z), -1: 반대 방향(-Z). 양쪽 부호를 함께 뒤집습니다.
+  FOLD_DIRECTION: -1,
+  // 완전히 접히는 데 걸리는 시간(초). 숫자가 작을수록 빠릅니다.
+  FOLD_SECONDS: 4.5,
+  // 그림 전체의 위아래 방향: 0은 원래 방향, Math.PI는 180도 회전.
+  // 접힘 방향과 그림의 위아래 방향은 별개의 설정입니다.
+  ARTWORK_ROTATION_Z: 0,
+  NET_AR_SCALE: 1 / 3,  // 전개도 전체를 인식할 때의 크기
+  FACE_AR_SCALE: 0.75, // 조립된 큐브의 상체 면을 인식할 때의 크기
+  AR_GAP: 0.02        // 인식 이미지와 가상 모델 사이의 간격
+};
+
+// ── 2. HTML 요소와 상태 ───────────────────────────────────────
+const $ = selector => document.querySelector(selector);
+const view = $('#view');
+const status = $('#status');
+let fold = 0;            // 0: 펼침, 0.5: 중간, 1: 큐브
+let playing = false;     // 자동 재생 여부
+let previousTime = 0;    // 이전 프레임의 시간
+let arMode = false;
+let busy = false;        // AR 버튼 연속 클릭 방지
+let mind = null;
+let preview = null;
+let controls = null;
+let detectedTargets = [];
+let bodies = [];         // 미리보기 및 AR에서 사용하는 모델 목록
+const textures = {};    // 여섯 면의 이미지를 공유해 메모리를 절약
+$('#ar').disabled = true;
+
+// ── 3. 핵심: 경첩 그룹의 회전각 변경 ──────────────────────────
+function applyFold(body, amount) {
+  // Three.js는 라디안 단위를 사용합니다. Math.PI / 2는 90도입니다.
+  // 방향값을 -1로 바꾸면 모든 경첩이 기존과 반대로 접힙니다.
+  const angle = amount * Math.PI / 2 * CONFIG.FOLD_DIRECTION;
+  const h = body.userData.hinges;
+  // 좌우 면은 Y축(세로축)을 중심으로 회전합니다.
+  // 서로 마주 보는 방향이므로 왼쪽과 오른쪽의 부호가 다릅니다.
+  h.left.rotation.y = angle;
+  h.right.rotation.y = -angle;
+  // 위아래 면은 X축(가로축)을 중심으로 회전합니다.
+  h.top.rotation.x = angle;
+  h.bottom.rotation.x = -angle;
+  // lid는 bottom의 자식이므로 bottom 회전에 추가로 회전합니다.
+  h.lid.rotation.x = -angle;
+}
+
+// ── 4. 전개도 만들기: 중앙 + 좌우 + 위아래 + 끝 면 ────────────
+function makeBody() {
+  const body = new T.Group();
+  body.rotation.z = CONFIG.ARTWORK_ROTATION_Z;
+  const hinges = {};
+  function addFace(name, parent, x, y) {
+    const geometry = new T.PlaneGeometry(1, 1); // 한 면은 1×1
+    const material = new T.MeshStandardMaterial({
+      map: textures[name],
+      roughness: 0.92,   // 반사가 적은 종이 같은 표면
+      // 앞뒤 모두 같은 그림이 보입니다. 실제 종이의 흰 뒷면과는 다릅니다.
+      side: T.DoubleSide
+    });
+    const face = new T.Mesh(geometry, material);
+    face.position.set(x, y, 0);
+    parent.add(face);
+  }
+  // 중앙 면은 고정하고 주변 면만 접습니다.
+  addFace('center', body, 0, 0);
+  // [이름, 경첩X, 경첩Y, 경첩 기준 면 중심X, 면 중심Y]
+  const definitions = [
+    ['left', -0.5, 0, -0.5, 0],
+    ['right', 0.5, 0, 0.5, 0],
+    ['top', 0, 0.5, 0, 0.5],
+    ['bottom', 0, -0.5, 0, -0.5]
+  ];
+  for (const [name, hx, hy, fx, fy] of definitions) {
+    // 면 자체를 회전하면 중심에서 뒤집힙니다.
+    // 모서리에 그룹(경첩)을 만들고 면을 반 칸 떨어뜨려 붙여야 접힙니다.
+    const hinge = new T.Group();
+    hinge.position.set(hx, hy, 0);
+    body.add(hinge);
+    addFace(name, hinge, fx, fy);
+    hinges[name] = hinge;
+  }
+  // 마지막 면은 아래쪽 면 끝에 연결합니다.
+  // body → bottom 경첩 → lid 경첩 → lid 면의 계층 구조입니다.
+  const lidHinge = new T.Group();
+  lidHinge.position.y = -1;
+  hinges.bottom.add(lidHinge);
+  addFace('lid', lidHinge, 0, -0.5);
+  hinges.lid = lidHinge;
+  body.userData.hinges = hinges;
+  applyFold(body, fold);
+  bodies.push(body);
+  return body;
+}
+
+// ── 5. 조명: 전체 밝기와 접힌 면의 명암 ────────────────────────
+function addLights(scene) {
+  scene.add(new T.HemisphereLight(0xffffff, 0xb8a992, 2.8));
+  const light = new T.DirectionalLight(0xffffff, 2);
+  light.position.set(3, 4, 5);
+  scene.add(light);
+}
+function setFold(value) {
+  fold = T.MathUtils.clamp(value, 0, 1); // 범위를 벗어나지 않도록 제한
+  $('#fold').value = fold;
+  $('#pct').textContent = Math.round(fold * 100) + '%';
+  bodies.forEach(body => applyFold(body, fold));
+}
+
+// ── 6. 매 프레임 갱신: 경과 시간으로 애니메이션 속도 계산 ───────
+function animate(now) {
+  // 탭을 벗어났다 돌아온 경우 갑자기 접히는 것을 막습니다.
+  const dt = previousTime ? Math.min((now - previousTime) / 1000, 0.05) : 0;
+  previousTime = now;
+  if (playing) {
+    setFold(fold + dt / Math.max(CONFIG.FOLD_SECONDS, 0.1));
+    if (fold >= 1) {
+      playing = false;
+      $('#play').textContent = '다시 접기';
+    }
+  }
+  if (arMode && mind) {
+    mind.renderer.render(mind.scene, mind.camera);
+  } else if (preview) {
+    controls.update(); // 드래그 회전의 부드러운 감속 반영
+    preview.renderer.render(preview.scene, preview.camera);
+  }
+  requestAnimationFrame(animate);
+}
+
+// ── 7. 이미지 로드 및 일반 3D 미리보기 초기화 ──────────────────
+async function initialize() {
+  try {
+    const loader = new T.TextureLoader();
+    for (const name of ['center', 'left', 'right', 'top', 'bottom', 'lid']) {
+      const texture = await loader.loadAsync('assets/' + name + '.png');
+      texture.colorSpace = T.SRGBColorSpace; // 이미지 색을 올바르게 표시
+      textures[name] = texture;
+    }
+    const scene = new T.Scene();
+    scene.background = new T.Color('#eae6df');
+    // 시야각, 화면 비율, 가까운 표시 거리, 먼 표시 거리 순서입니다.
+    const camera = new T.PerspectiveCamera(36, innerWidth / innerHeight, 0.01, 100);
+    camera.position.set(0, 0.4, 8.5);
+    const renderer = new T.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    view.appendChild(renderer.domElement);
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, -0.4, 0);
+    controls.enableDamping = true;
+    controls.minDistance = 3;
+    controls.maxDistance = 14;
+    addLights(scene);
+    scene.add(makeBody());
+    preview = { scene, camera, renderer };
+    $('#ar').disabled = false;
+    status.textContent = '슬라이더를 움직이거나 접기 버튼을 눌러 보세요.';
+    requestAnimationFrame(animate);
+  } catch (error) {
+    status.textContent = '준비 실패: ' + error.message + ' · 인터넷 연결과 assets 폴더를 확인해 주세요.';
+  }
+}
+
+// ── 8. 버튼과 슬라이더 ────────────────────────────────────────
+$('#play').onclick = () => {
+  if (fold >= 1) setFold(0);
+  playing = !playing;
+  $('#play').textContent = playing ? '일시정지' : '접기 · 재생';
+};
+$('#reset').onclick = () => {
+  playing = false;
+  setFold(0);
+  $('#play').textContent = '접기 · 재생';
+};
+$('#fold').oninput = event => {
+  playing = false; // 손으로 조절할 때는 자동 재생을 멈춥니다.
+  setFold(Number(event.target.value));
+  $('#play').textContent = '접기 · 재생';
+};
+
+// ── 9. 카메라 AR: 이미지 인식 위치에 모델 연결 ─────────────────
+$('#ar').onclick = async () => {
+  if (busy || arMode || !preview) return;
+  if (!window.isSecureContext) {
+    status.textContent = '카메라 AR은 HTTPS 주소 또는 localhost에서 실행해 주세요.';
+    return;
+  }
+  busy = true;
+  $('#ar').disabled = true;
+  try {
+    status.textContent = 'AR 엔진 준비 중…';
+    const { MindARThree } = await import('https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js');
+    mind = new MindARThree({
+      container: view,
+      // 0번은 전개도 전체, 1번은 중앙 상체 면입니다.
+      // 이미지를 교체하면 targets.mind도 다시 컴파일해야 합니다.
+      imageTargetSrc: 'assets/targets.mind',
+      maxTrack: 1,
+      filterMinCF: 0.001,
+      filterBeta: 0.01,
+      missTolerance: 5,
+      warmupTolerance: 3,
+      uiLoading: 'yes', uiScanning: 'yes', uiError: 'yes'
+    });
+    addLights(mind.scene);
+    for (let index = 0; index < 2; index++) {
+      // anchor는 인식한 이미지의 위치·방향을 따라가는 기준점입니다.
+      const anchor = mind.addAnchor(index);
+      const body = makeBody();
+      const scale = index === 0 ? CONFIG.NET_AR_SCALE : CONFIG.FACE_AR_SCALE;
+      body.scale.setScalar(scale);
+      // 전개도 전체의 중심과 중앙 정사각형의 중심 차이를 보정합니다.
+      if (index === 0) body.position.y = 0.5 / 3;
+      // 반대로 접으면 모델 깊이가 -Z로 향합니다.
+      // 한 면 깊이만큼 앞으로 옮겨 인식 이미지 뒤로 들어가지 않게 합니다.
+      // 따라서 -1 모드의 전개도는 이미지에서 떠 있는 상태로 시작합니다.
+      const depthOffset = CONFIG.FOLD_DIRECTION === -1 ? scale : 0;
+      body.position.z = depthOffset + CONFIG.AR_GAP;
+      anchor.group.add(body);
+      anchor.onTargetFound = () => {
+        detectedTargets[index] = true;
+        status.textContent = index === 0
+          ? '전개도 인식 · 접기 버튼을 눌러 보세요.'
+          : '큐브의 상체 면 인식 · 접기 버튼을 눌러 보세요.';
+      };
+      anchor.onTargetLost = () => {
+        detectedTargets[index] = false;
+        if (!detectedTargets.some(Boolean)) status.textContent = '전개도 전체 또는 큐브의 상체 면을 비춰 주세요.';
+      };
+    }
+    preview.renderer.domElement.style.display = 'none';
+    await mind.start();
+    arMode = true;
+    document.body.classList.add('ar');
+    status.textContent = '전개도 전체 또는 큐브의 상체 면을 비춰 주세요.';
+  } catch (error) {
+    await stopAR();
+    status.textContent = 'AR 시작 실패: ' + error.message + ' · HTTPS, 카메라 권한, 인터넷 연결을 확인해 주세요.';
+  } finally {
+    busy = false;
+    $('#ar').disabled = false;
+  }
+};
+
+// ── 10. 카메라 종료와 메모리 정리 ─────────────────────────────
+async function stopAR() {
+  arMode = false;
+  const currentMind = mind;
+  mind = null;
+  if (currentMind) {
+    try { await currentMind.stop(); }
+    catch (error) { console.warn('AR 종료 중:', error); }
+    currentMind.renderer.dispose();
+    currentMind.renderer.domElement.remove();
+  }
+  // 첫 번째 모델은 일반 미리보기용이므로 유지합니다.
+  for (const body of bodies.slice(1)) {
+    body.traverse(object => {
+      if (!object.isMesh) return;
+      object.geometry.dispose();
+      object.material.dispose();
+      // 텍스처는 미리보기와 공유하므로 삭제하지 않습니다.
+    });
+  }
+  bodies = bodies.slice(0, 1);
+  detectedTargets = [];
+  view.querySelectorAll('video').forEach(video => video.remove());
+  document.querySelectorAll('.mindar-ui-overlay').forEach(el => el.remove());
+  if (preview) preview.renderer.domElement.style.display = 'block';
+  document.body.classList.remove('ar');
+}
+$('#back').onclick = async () => {
+  await stopAR();
+  status.textContent = '3D 미리보기로 돌아왔습니다.';
+};
+window.addEventListener('pagehide', () => mind?.stop());
+window.addEventListener('resize', () => {
+  if (!preview) return;
+  preview.camera.aspect = innerWidth / innerHeight;
+  preview.camera.updateProjectionMatrix();
+  preview.renderer.setSize(innerWidth, innerHeight);
+});
+initialize();
+
+</script></body></html>
